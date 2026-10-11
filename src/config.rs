@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg_attr(target_os = "ios", allow(dead_code))]
+#[derive(Clone)]
 pub struct Startup {
     pub wasm_path: PathBuf,
     pub cache_dir: PathBuf,
@@ -27,6 +28,10 @@ const DEFAULT_CONFIG: &str = r#"{
 "#;
 
 fn support_dir() -> PathBuf {
+    if cfg!(target_os = "android") {
+        // the app's external files dir (Android/data/<package>/files), set by android.rs
+        return PathBuf::from(std::env::var("MUGUET_SUPPORT").unwrap_or_else(|_| "/sdcard/Android/data/ch.cclerc.muguet/files".into()));
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     if cfg!(target_os = "ios") {
         return PathBuf::from(home).join("Documents");
@@ -67,7 +72,7 @@ fn redirect_logs_if_detached() {
         fn dup2(old: i32, new: i32) -> i32;
     }
 
-    if cfg!(target_os = "ios") {
+    if crate::MOBILE {
         return;
     }
     let in_bundle = std::env::current_exe().map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")).unwrap_or(false);
@@ -103,7 +108,15 @@ pub fn setup() -> anyhow::Result<Startup> {
     let build = build?;
     #[cfg(target_os = "ios")]
     let build = build.unwrap_or_default();
-    Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir: support, engine_args })
+    Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir: cache_dir(support), engine_args })
+}
+
+fn cache_dir(support: PathBuf) -> PathBuf {
+    // Android mounts external storage noexec: compiled game code goes to internal storage
+    match std::env::var_os("MUGUET_CACHE").filter(|_| cfg!(target_os = "android")) {
+        Some(dir) => PathBuf::from(dir),
+        None => support,
+    }
 }
 
 fn locate() -> anyhow::Result<PathBuf> {
@@ -117,9 +130,15 @@ fn locate() -> anyhow::Result<PathBuf> {
 
 const SETTING_VARS: &[&str] = &["MUGUET_SCALE", "MUGUET_MOUSE_SENS", "MUGUET_TOUCH_SENS", "MUGUET_RES", "MUGUET_FULLSCREEN", "MUGUET_MUTE", "MUGUET_HOST", "MUGUET_SERVER", "MUGUET_NAME"];
 
+/// Forget settings applied from an earlier read of config.json (it changed since).
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn clear_settings() {
+    for v in SETTING_VARS { std::env::remove_var(v); }
+}
+
 #[cfg(target_os = "ios")]
 pub fn reload() -> Vec<String> {
-    for v in SETTING_VARS { std::env::remove_var(v); }
+    clear_settings();
     let args = settings(&support_dir().join("config.json"));
     if let Err(e) = locate() {
         eprintln!("[config] {e:#}");

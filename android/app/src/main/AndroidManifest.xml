@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- muguet - AndroidManifest.xml -->
+<!-- Constantin Clerc (c22dev) - 0.1 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Vulkan 1.1 -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen.multitouch" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <!-- multiplayer (UDP) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="Muguet"
+        android:icon="@mipmap/ic_launcher"
+        android:appCategory="game"
+        android:isGame="true"
+        android:allowBackup="false"
+        android:theme="@style/Theme.Muguet">
+
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
+
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- the game: NativeActivity entering android_main in libmuguet.so -->
+        <activity
+            android:name=".GameActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="false"
+            android:preferMinimalPostProcessing="true"
+            android:theme="@style/Theme.Muguet.Game"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection|colorMode|touchscreen">
+            <meta-data android:name="android.app.lib_name" android:value="muguet" />
+        </activity>
+    </application>
+</manifest>

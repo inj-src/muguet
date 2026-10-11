@@ -28,10 +28,26 @@ const BG_LIMIT: usize = 24000;
 
 pub struct SurfaceHandoff {
     pub instance: Instance,
-    pub surface: Surface<'static>,
     pub window: Arc<winit::window::Window>,
 }
 pub static SURFACE: Mutex<Option<SurfaceHandoff>> = Mutex::new(None);
+
+/// The window's surface and how many times it was replaced. It lives outside the gpu thread
+/// because Android takes the window away whenever the app leaves the screen: the event loop drops
+/// the surface right then (waiting at most for the frame being presented) and makes a new one on
+/// return, and present() borrows whichever is current.
+static LIVE: Mutex<(u64, Option<Surface<'static>>)> = Mutex::new((0, None));
+
+pub fn set_surface(surface: Option<Surface<'static>>) {
+    let mut live = LIVE.lock().unwrap();
+    live.0 += 1;
+    live.1 = surface;
+}
+
+/// Metal on Apple platforms, Vulkan everywhere else.
+pub fn backends() -> Backends {
+    if cfg!(target_vendor = "apple") { Backends::METAL } else { Backends::VULKAN }
+}
 pub static STARTED: AtomicBool = AtomicBool::new(false);
 
 pub static OCCLUDED: AtomicBool = AtomicBool::new(false);
@@ -149,48 +165,71 @@ fn bc_soft_format(f: TextureFormat) -> TextureFormat {
 }
 
 fn bc_decode(bc: TextureFormat, src: &[u8], bpr: u32, rows: u32, layers: u32, w: u32, h: u32) -> (Vec<u8>, u32) {
-    use TextureFormat as T;
+    static CORES: LazyLock<usize> = LazyLock::new(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
     let px = bc_soft_format(bc).block_copy_size(None).unwrap_or(4) as usize;
-    let block = bc.block_copy_size(None).unwrap_or(16) as usize;
-    let (bw, bh) = (w.div_ceil(4) as usize, h.div_ceil(4) as usize);
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![0u8; w * h * px * layers as usize];
-    let mut tmp = [0u8; 4 * 4 * 8];
-    let mut half = [0u16; 4 * 4 * 3];
-    for l in 0..layers as usize {
-        for by in 0..bh {
-            for bx in 0..bw {
-                let o = (l * rows as usize + by) * bpr as usize + bx * block;
-                let Some(b) = src.get(o..o + block) else { continue };
-                match bc {
-                    T::Bc1RgbaUnorm | T::Bc1RgbaUnormSrgb => bcdec_rs::bc1(b, &mut tmp, 16),
-                    T::Bc2RgbaUnorm | T::Bc2RgbaUnormSrgb => bcdec_rs::bc2(b, &mut tmp, 16),
-                    T::Bc3RgbaUnorm | T::Bc3RgbaUnormSrgb => bcdec_rs::bc3(b, &mut tmp, 16),
-                    T::Bc4RUnorm => bcdec_rs::bc4(b, &mut tmp, 4, false),
-                    T::Bc5RgUnorm => bcdec_rs::bc5(b, &mut tmp, 8, false),
-                    T::Bc6hRgbUfloat => {
-                        bcdec_rs::bc6h_half(b, &mut half, 12, false);
-                        for i in 0..16 {
-                            for c in 0..4 {
-                                let v = if c < 3 { half[i * 3 + c] } else { 0x3c00 };
-                                tmp[i * 8 + c * 2..i * 8 + c * 2 + 2].copy_from_slice(&v.to_le_bytes());
-                            }
-                        }
-                    }
-                    _ => bcdec_rs::bc7(b, &mut tmp, 16),
-                }
-                for r in 0..4 {
-                    let y = by * 4 + r;
-                    if y >= h { break; }
-                    let n = (w - bx * 4).min(4) * px;
-                    let d = ((l * h + y) * w + bx * 4) * px;
-                    out[d..d + n].copy_from_slice(&tmp[r * 4 * px..r * 4 * px + n]);
-                }
+    if out.is_empty() {
+        return (out, (w * px) as u32);
+    }
+    // one job per row of 4x4 blocks; big textures (streamed in while playing) are split across cores
+    let mut jobs: Vec<(usize, usize, &mut [u8])> = out
+        .chunks_mut(w * h * px)
+        .enumerate()
+        .flat_map(|(l, layer)| layer.chunks_mut(4 * w * px).enumerate().map(move |(by, d)| (l, by, d)))
+        .collect();
+    let threads = if w * h * px * layers as usize >= 1 << 20 { (*CORES).min(jobs.len()) } else { 1 };
+    if threads <= 1 {
+        for (l, by, d) in jobs.iter_mut() { bc_decode_row(bc, src, bpr, rows, *l, *by, w, px, d); }
+    } else {
+        let n = jobs.len();
+        let mut groups: Vec<Vec<(usize, usize, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
+        for (i, job) in jobs.drain(..).enumerate() { groups[i * threads / n].push(job); }
+        std::thread::scope(|sc| {
+            for group in groups {
+                sc.spawn(move || for (l, by, d) in group { bc_decode_row(bc, src, bpr, rows, l, by, w, px, d); });
             }
-        }
+        });
     }
     (out, (w * px) as u32)
 }
+
+/// Decodes block row `by` of layer `l` into `dst`, its (up to) 4 rows of pixels.
+#[allow(clippy::too_many_arguments)]
+fn bc_decode_row(bc: TextureFormat, src: &[u8], bpr: u32, rows: u32, l: usize, by: usize, w: usize, px: usize, dst: &mut [u8]) {
+    use TextureFormat as T;
+    let block = bc.block_copy_size(None).unwrap_or(16) as usize;
+    let lines = dst.len() / (w * px);
+    let mut tmp = [0u8; 4 * 4 * 8];
+    let mut half = [0u16; 4 * 4 * 3];
+    for bx in 0..w.div_ceil(4) {
+        let o = (l * rows as usize + by) * bpr as usize + bx * block;
+        let Some(b) = src.get(o..o + block) else { continue };
+        match bc {
+            T::Bc1RgbaUnorm | T::Bc1RgbaUnormSrgb => bcdec_rs::bc1(b, &mut tmp, 16),
+            T::Bc2RgbaUnorm | T::Bc2RgbaUnormSrgb => bcdec_rs::bc2(b, &mut tmp, 16),
+            T::Bc3RgbaUnorm | T::Bc3RgbaUnormSrgb => bcdec_rs::bc3(b, &mut tmp, 16),
+            T::Bc4RUnorm => bcdec_rs::bc4(b, &mut tmp, 4, false),
+            T::Bc5RgUnorm => bcdec_rs::bc5(b, &mut tmp, 8, false),
+            T::Bc6hRgbUfloat => {
+                bcdec_rs::bc6h_half(b, &mut half, 12, false);
+                for i in 0..16 {
+                    for c in 0..4 {
+                        let v = if c < 3 { half[i * 3 + c] } else { 0x3c00 };
+                        tmp[i * 8 + c * 2..i * 8 + c * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            _ => bcdec_rs::bc7(b, &mut tmp, 16),
+        }
+        for r in 0..lines.min(4) {
+            let n = (w - bx * 4).min(4) * px;
+            let d = (r * w + bx * 4) * px;
+            dst[d..d + n].copy_from_slice(&tmp[r * 4 * px..r * 4 * px + n]);
+        }
+    }
+}
+
 fn map_format(f: u32, bind: u32) -> Fmt {
     use TextureFormat as T;
     let ds = bind & BIND_DS != 0;
@@ -750,8 +789,11 @@ pub struct Gpu {
     device: Device,
     queue: Queue,
     adapter: Adapter,
-    surface: Option<(Surface<'static>, Arc<winit::window::Window>)>,
+    window: Option<Arc<winit::window::Window>>,
+    surface_gen: u64,
     surface_format: TextureFormat,
+    #[cfg(target_os = "android")]
+    hud: Option<crate::hud::Hud>,
     surface_size: (u32, u32),
     objs: Vec<Option<Obj>>,
     enc: Option<CommandEncoder>,
@@ -833,7 +875,7 @@ unsafe impl Send for Gpu {}
 
 pub fn max_msaa() -> u32 {
     let mut d = InstanceDescriptor::new_without_display_handle();
-    d.backends = Backends::METAL;
+    d.backends = backends();
     let Ok(adapter) = pollster::block_on(Instance::new(d).request_adapter(&RequestAdapterOptions::default())) else { return 4 };
     let formats = [TextureFormat::Rgba8Unorm, TextureFormat::Rgba16Float, TextureFormat::Rg11b10Ufloat, TextureFormat::Depth32FloatStencil8];
     [16, 8, 4, 2]
@@ -845,13 +887,15 @@ pub fn max_msaa() -> u32 {
 impl Gpu {
     fn new(mem: SharedMemory, ring: u64, _size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
         let (base, _) = mem_base_len(&mem);
-        let (instance, surface) = match handoff {
-            Some(h) => (h.instance, Some((h.surface, h.window))),
-            None => { let mut d = InstanceDescriptor::new_without_display_handle(); d.backends = Backends::METAL; (Instance::new(d), None) }
+        let (instance, window) = match handoff {
+            Some(h) => (h.instance, Some(h.window)),
+            None => { let mut d = InstanceDescriptor::new_without_display_handle(); d.backends = backends(); (Instance::new(d), None) }
         };
+        let live = LIVE.lock().unwrap();
+        let surface = live.1.as_ref().filter(|_| window.is_some());
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
-            compatible_surface: surface.as_ref().map(|s| &s.0),
+            compatible_surface: surface,
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))?;
@@ -896,12 +940,13 @@ impl Gpu {
         let info = adapter.get_info();
         log(&format!("device ready: {} ({:?}), features {:?}", info.name, info.backend, features));
         let surface_format = surface
-            .as_ref()
-            .map(|(s, _)| {
+            .map(|s| {
                 let caps = s.get_capabilities(&adapter);
                 caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0])
             })
             .unwrap_or(TextureFormat::Bgra8Unorm);
+        let surface_gen = live.0;
+        drop(live);
         let shader_dir = PathBuf::from(std::env::var("MUGUET_SHADERS").unwrap_or_default());
         let index_text = std::fs::read_to_string(shader_dir.join("index.json")).unwrap_or_else(|e| {
             log(&format!("no shader index at {}: {e}", shader_dir.display()));
@@ -927,7 +972,9 @@ impl Gpu {
         };
         Ok(Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
-            base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
+            base, mem, ring, device, queue, adapter, window, surface_gen, surface_format, surface_size: (0, 0),
+            #[cfg(target_os = "android")]
+            hud: None,
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
@@ -3142,12 +3189,16 @@ impl Gpu {
     fn present(&mut self, id: u32) {
         self.materialize_clears(id);
         let visible = !OCCLUDED.load(Ordering::Relaxed);
-        if let (Some(t), Some(_), true) = (self.tex(id), self.surface.as_ref(), visible) {
+        let live = LIVE.lock().unwrap();
+        if live.0 != self.surface_gen {
+            self.surface_gen = live.0;
+            self.surface_size = (0, 0);
+        }
+        if let (Some(t), Some(surface), Some(window), true) = (self.tex(id), live.1.as_ref(), self.window.clone(), visible) {
             let (w, h) = (t.desc.w, t.desc.h);
             let tex = t.tex.clone();
             self.end_pass();
             if self.surface_size != (w, h) {
-                let (surface, window) = self.surface.as_ref().unwrap();
                 let caps = surface.get_capabilities(&self.adapter);
                 surface.configure(&self.device, &SurfaceConfiguration {
                     usage: TextureUsages::RENDER_ATTACHMENT,
@@ -3180,7 +3231,13 @@ impl Gpu {
                     dev.create_bind_group(&BindGroupDescriptor { label: None, layout: &blit.get_bind_group_layout(0), entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&v) }] })
                 }).clone()
             };
-            let frame = match self.surface.as_ref().unwrap().0.get_current_texture() {
+            #[cfg(target_os = "android")]
+            let hud = {
+                let mut hud = self.hud.take().unwrap_or_else(|| crate::hud::Hud::new(&self.device, self.surface_format));
+                hud.prepare(&self.queue);
+                hud
+            };
+            let frame = match surface.get_current_texture() {
                 CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => Some(f),
                 other => { log_once("surface", &format!("surface texture unavailable: {other:?}")); self.surface_size = (0, 0); None }
             };
@@ -3197,16 +3254,27 @@ impl Gpu {
                     p.set_pipeline(&blit);
                     p.set_bind_group(0, &bg, &[]);
                     p.draw(0..3, 0..1);
+                    #[cfg(target_os = "android")]
+                    hud.draw(&mut p);
                 }
                 self.flush();
                 self.queue.present(frame);
             } else {
                 self.flush();
             }
+            #[cfg(target_os = "android")]
+            { self.hud = Some(hud); }
         } else {
             self.flush();
+            if cfg!(target_os = "android") && live.1.is_none() {
+                // backgrounded: no vsync to pace the game, don't let it spin
+                std::thread::sleep(Duration::from_millis(16));
+            }
         }
+        drop(live);
         self.collect_pipelines();
+        #[cfg(target_os = "android")]
+        crate::android::frame_presented();
         self.presents += 1;
         PRESENTS.store(self.presents, Ordering::Relaxed);
         self.log_fps();

@@ -878,7 +878,7 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
             more_bullets(&mut c);
         }
 
-        if crate::pad::ACTIVE.load(Ordering::Relaxed) || cfg!(target_os = "ios") {
+        if crate::pad::ACTIVE.load(Ordering::Relaxed) || crate::MOBILE {
             let ped = c.i("PlayerPedId", &[]);
             let in_car = ped != 0 && c.exists(ped) && c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0;
             crate::pad::IN_VEHICLE.store(in_car, Ordering::Relaxed);

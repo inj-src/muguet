@@ -1340,6 +1340,7 @@ dependencies = [
  "anyhow",
  "bcdec_rs",
  "cpal",
+ "jni-sys 0.3.1",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",

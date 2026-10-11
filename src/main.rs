@@ -1,6 +1,8 @@
 // muguet - main.rs
 // Constantin Clerc (c22dev) - 0.1
 
+#[cfg(target_os = "android")]
+mod android;
 mod app;
 mod audio;
 mod config;
@@ -16,8 +18,10 @@ mod pad;
 mod patch;
 mod proto;
 mod server;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 mod touch;
+#[cfg(target_os = "android")]
+mod hud;
 
 use anyhow::{Context, Result};
 use std::sync::atomic::AtomicU64;
@@ -46,6 +50,10 @@ pub struct HostState {
 
 pub static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
 
+/// Phones and tablets: touch overlay, no mouse lock, the game's code compiled ahead of the window.
+pub const MOBILE: bool = cfg!(any(target_os = "ios", target_os = "android"));
+
+#[cfg(target_vendor = "apple")]
 pub fn footprint_mb() -> u64 {
     extern "C" {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
@@ -59,16 +67,38 @@ pub fn footprint_mb() -> u64 {
     info[2 + 7] >> 20
 }
 
+#[cfg(not(target_vendor = "apple"))]
+pub fn footprint_mb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb: u64 = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0);
+    kb >> 10
+}
+
 pub fn set_interactive_qos() {
     set_qos(QOS_CLASS_USER_INTERACTIVE);
 }
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+#[cfg(target_vendor = "apple")]
 fn set_qos(class: u32) {
     extern "C" {
         fn pthread_set_qos_class_self_np(qos: u32, relpri: i32) -> i32;
     }
     unsafe { pthread_set_qos_class_self_np(class, 0) };
+}
+#[cfg(not(target_vendor = "apple"))]
+fn set_qos(class: u32) {
+    // no QoS classes: Linux niceness per thread, the same levels Android gives its display
+    // threads (-8, THREAD_PRIORITY_URGENT_DISPLAY) and foreground work (-2)
+    extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        fn gettid() -> i32;
+    }
+    let nice = if class == QOS_CLASS_USER_INTERACTIVE { -8 } else { -2 };
+    let tid = unsafe { gettid() };
+    unsafe { setpriority(0, tid as u32, nice) };
+    #[cfg(target_os = "android")]
+    if class == QOS_CLASS_USER_INTERACTIVE { android::perf_thread(tid); }
 }
 
 fn engine_thread_qos(name: &str) -> u32 {
@@ -86,7 +116,7 @@ fn raise_open_file_limit() {
         fn getrlimit(resource: i32, rlp: *mut Rlimit) -> i32;
         fn setrlimit(resource: i32, rlp: *const Rlimit) -> i32;
     }
-    const RLIMIT_NOFILE: i32 = 8;
+    const RLIMIT_NOFILE: i32 = if cfg!(target_vendor = "apple") { 8 } else { 7 };
     let mut r = Rlimit { cur: 0, max: 0 };
     unsafe {
         if getrlimit(RLIMIT_NOFILE, &mut r) == 0 {
@@ -99,6 +129,7 @@ fn raise_open_file_limit() {
     }
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> Result<()> {
     raise_open_file_limit();
     let argv: Vec<String> = std::env::args().collect();
@@ -150,6 +181,11 @@ fn main() -> Result<()> {
     #[cfg(target_os = "ios")]
     let rt = None;
 
+    let args = engine_args(&startup);
+    app::run(rt, startup, args)
+}
+
+pub fn engine_args(startup: &config::Startup) -> Vec<String> {
     let mut args: Vec<String> = [
         "./this.program", "-rootdir=/game/", "-nodisplaycalibration", "-noSocialClub",
         "-pc:nosocialclub", "-nonetwork", "-output",
@@ -162,8 +198,7 @@ fn main() -> Result<()> {
     args.extend(startup.engine_args.clone());
 
     args.extend(std::env::args().skip(1).filter(|a| !a.starts_with("-psn_")));
-
-    app::run(rt, startup, args)
+    args
 }
 
 pub fn make_runtime(startup: &config::Startup) -> Result<Arc<Runtime>> {
@@ -276,10 +311,11 @@ impl CustomCodeMemory for SignedCode {
     fn unpublish_executable(&self, _ptr: *const u8, _len: usize) -> wasmtime::Result<()> { Ok(()) }
 }
 
+/// Where the game's code compiled for this game.wasm and this version of muguet is cached.
 #[cfg(feature = "jit")]
-fn load_module(engine: &Engine, startup: &config::Startup) -> Result<Module> {
-    let wasm_path = startup.wasm_path.clone();
-    let meta = std::fs::metadata(&wasm_path).with_context(|| format!("{}", wasm_path.display()))?;
+pub fn code_cache(startup: &config::Startup) -> Result<std::path::PathBuf> {
+    let wasm_path = &startup.wasm_path;
+    let meta = std::fs::metadata(wasm_path).with_context(|| format!("{}", wasm_path.display()))?;
     let stamp = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
 
     let mp_key = {
@@ -288,15 +324,48 @@ fn load_module(engine: &Engine, startup: &config::Startup) -> Result<Module> {
         (patch::VERSION, mp::COMMANDS, host::MISSING_TEXT).hash(&mut h);
         h.finish() as u32
     };
-    let cache = startup.cache_dir.join(format!("game-{}-{stamp}-{mp_key:08x}.cwasm", meta.len()));
+    Ok(startup.cache_dir.join(format!("game-{}-{stamp}-{mp_key:08x}.cwasm", meta.len())))
+}
 
-    if let Some(m) = cache.exists().then(|| unsafe { Module::deserialize_file(engine, &cache) }.ok()).flatten() {
+#[cfg(feature = "jit")]
+fn load_module(engine: &Engine, startup: &config::Startup) -> Result<Module> {
+    let wasm_path = startup.wasm_path.clone();
+    let cache = code_cache(startup)?;
+
+    if let Some(m) = cache.exists().then(|| load_cached(engine, &cache)).flatten() {
         return Ok(m);
     }
     eprintln!("[host] compiling {} to native code (one-time)…", wasm_path.display());
     let m = compile_patched(engine, &wasm_path)?;
+    if cfg!(target_os = "android") {
+        // phones have little internal storage: drop code compiled for an older game or muguet
+        for e in std::fs::read_dir(&startup.cache_dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("game-") && name.ends_with(".cwasm") { let _ = std::fs::remove_file(e.path()); }
+        }
+    }
     std::fs::write(&cache, m.serialize()?)?;
     Ok(m)
+}
+
+#[cfg(feature = "jit")]
+fn load_cached(engine: &Engine, cache: &std::path::Path) -> Option<Module> {
+    // Android won't map files from app storage as code: copy it into memory instead
+    if cfg!(target_os = "android") {
+        let bytes = std::fs::read(cache).ok()?;
+        return unsafe { Module::deserialize(engine, bytes) }.ok();
+    }
+    unsafe { Module::deserialize_file(engine, cache) }.ok()
+}
+
+/// Compiles the game's code into the cache ahead of the first launch (Android launcher).
+#[cfg(all(feature = "jit", target_os = "android"))]
+pub fn precompile(startup: &config::Startup) -> Result<()> {
+    if code_cache(startup)?.exists() {
+        return Ok(());
+    }
+    let engine = Engine::new(&engine_config()).map_err(anyhow::Error::from).context("engine")?;
+    load_module(&engine, startup).map(drop)
 }
 
 #[cfg(feature = "jit")]
@@ -544,6 +613,12 @@ pub fn read_cstr(mem: &SharedMemory, addr: u64) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[cfg(target_os = "android")]
+pub fn alert(title: &str, msg: &str) {
+    android::alert(title, msg);
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn alert(title: &str, msg: &str) {
     let script = format!("display alert \"{}\" message \"{}\" as critical",
         title.replace('"', "'"), msg.replace('"', "'"));

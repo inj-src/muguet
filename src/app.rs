@@ -19,6 +19,7 @@ struct App {
     startup: crate::config::Startup,
     args: Vec<String>,
     window: Option<Arc<Window>>,
+    instance: Option<wgpu::Instance>,
     started: bool,
 
     #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
@@ -45,9 +46,15 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         gpu::SUSPENDED.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         input::set_focus(true);
-        if self.window.is_some() {
+        if let Some(window) = self.window.clone() {
+            // Android: a new native window after the app was in the background
+            if cfg!(target_os = "android") {
+                if let Some(instance) = &self.instance {
+                    gpu::set_surface(instance.create_surface(window).map_err(|e| eprintln!("[app] surface: {e}")).ok());
+                }
+            }
             return;
         }
         let attrs = Window::default_attributes()
@@ -65,14 +72,16 @@ impl ApplicationHandler for App {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         }
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = wgpu::Backends::METAL;
+        desc.backends = gpu::backends();
         let instance = wgpu::Instance::new(desc);
         let surface = instance.create_surface(window.clone()).expect("create surface");
-        *gpu::SURFACE.lock().unwrap() = Some(gpu::SurfaceHandoff { instance, surface, window: window.clone() });
+        gpu::set_surface(Some(surface));
+        *gpu::SURFACE.lock().unwrap() = Some(gpu::SurfaceHandoff { instance: instance.clone(), window: window.clone() });
+        self.instance = Some(instance);
         let (w, h) = backbuffer_size(&window);
         input::set_size(w, h);
         eprintln!("[app] window {}x{} px, back buffer {w}x{h}", window.inner_size().width, window.inner_size().height);
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         crate::touch::install(&window);
         self.window = Some(window);
 
@@ -84,8 +93,17 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _el: &ActiveEventLoop) {
         gpu::SUSPENDED.store(true, std::sync::atomic::Ordering::Relaxed);
         input::set_focus(false);
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         crate::touch::release();
+        // Android destroys the native window once this returns
+        if cfg!(target_os = "android") {
+            gpu::set_surface(None);
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn user_event(&mut self, _el: &ActiveEventLoop, _event: ()) {
+        crate::android::drain_input();
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -159,8 +177,10 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         #[allow(unused_mut)]
-        let mut wait = if crate::pad::poll() { 8 } else if cfg!(target_os = "ios") { 250 } else { 1000 };
-        #[cfg(target_os = "ios")]
+        let mut wait = if crate::pad::poll() { 8 } else if crate::MOBILE { 250 } else { 1000 };
+        #[cfg(target_os = "android")]
+        crate::android::drain_input();
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         if crate::touch::refresh() { wait = 15; }
         #[cfg(target_os = "ios")]
         if !self.started {
@@ -184,25 +204,25 @@ impl App {
         self.started = true;
         let (w, h) = backbuffer_size(&window);
         input::set_size(w, h);
-        let rt = match self.rt.clone() {
-            Some(rt) => rt,
-            None => match crate::make_runtime(&self.startup) {
-                Ok(rt) => {
-                    self.rt = Some(rt.clone());
-                    rt
-                }
-                Err(e) => {
-                    eprintln!("[host] {e:#}");
-                    return;
-                }
-            },
-        };
+        let (rt, startup) = (self.rt.clone(), self.startup.clone());
         let mut args = self.args.clone();
         args.extend(["-wgpu".to_string(), format!("-width={w}"), format!("-height={h}")]);
+        // loading the game's code takes seconds: off the event loop, which Android expects to answer
         std::thread::Builder::new()
             .name("engine-main".into())
             .stack_size(64 << 20)
             .spawn(move || {
+                let rt = match rt.map(Ok).unwrap_or_else(|| crate::make_runtime(&startup)) {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("[host] {e:#}");
+                        if cfg!(target_os = "android") {
+                            crate::alert("Muguet", &format!("{e:#}"));
+                            std::process::exit(1);
+                        }
+                        return;
+                    }
+                };
                 if let Err(e) = crate::run_engine(&rt, args) {
                     eprintln!("[host] engine failed: {e:?}");
                 }
@@ -262,9 +282,17 @@ impl App {
 }
 
 pub fn run(rt: Option<Arc<Runtime>>, startup: crate::config::Startup, args: Vec<String>) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "android"))]
     let event_loop = EventLoop::new()?;
+    #[cfg(target_os = "android")]
+    let event_loop = {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+        let el = EventLoop::builder().with_android_app(crate::android::app()).build()?;
+        crate::android::set_proxy(el.create_proxy());
+        el
+    };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { mode_chosen: false, rt, startup, args, window: None, started: false, launcher_shown: false, locked: false, mods: ModifiersState::empty(), wheel_accum: 0.0 };
+    let mut app = App { mode_chosen: false, rt, startup, args, window: None, instance: None, started: false, launcher_shown: false, locked: false, mods: ModifiersState::empty(), wheel_accum: 0.0 };
     event_loop.run_app(&mut app)?;
     Ok(())
 }

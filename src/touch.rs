@@ -2,14 +2,14 @@
 // Constantin Clerc (c22dev) - 0.1
 
 use crate::input;
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::NSString;
 use std::collections::{HashMap, HashSet};
-use winit::event::{Touch, TouchPhase};
+use view::{circle, label, move_to, set_alpha_bg, set_hidden, set_text, View};
+use winit::event::TouchPhase;
+#[cfg(target_os = "ios")]
+use winit::event::Touch;
 use winit::window::Window;
+#[cfg(target_os = "android")]
+use crate::hud::view;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
@@ -92,17 +92,17 @@ enum Grip {
 }
 
 struct Btn {
-    view: Retained<AnyObject>,
-    label: Retained<AnyObject>,
+    view: View,
+    label: View,
     center: (f64, f64),
     radius: f64,
 }
 
 struct Overlay {
-    root: Retained<AnyObject>,
+    root: View,
     buttons: Vec<Btn>,
-    stick_base: Retained<AnyObject>,
-    stick_knob: Retained<AnyObject>,
+    stick_base: View,
+    stick_knob: View,
     stick_home: (f64, f64),
 
     safe: (f64, f64, f64, f64),
@@ -125,75 +125,91 @@ thread_local! {
     static OVERLAY: std::cell::RefCell<Option<Overlay>> = const { std::cell::RefCell::new(None) };
 }
 
-fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
-    CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } }
-}
+/// The overlay drawn with UIKit views on top of the game's view.
+#[cfg(target_os = "ios")]
+mod view {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_foundation::NSString;
+    use winit::window::Window;
 
-fn color(white: f64, alpha: f64) -> Retained<AnyObject> {
-    unsafe { msg_send![class!(UIColor), colorWithWhite: white, alpha: alpha] }
-}
+    pub type View = Retained<AnyObject>;
 
-fn circle(parent: &AnyObject, center: (f64, f64), r: f64, white: f64, alpha: f64) -> Retained<AnyObject> {
-    unsafe {
-        let v: Retained<AnyObject> = msg_send![class!(UIView), new];
-        let _: () = msg_send![&*v, setFrame: rect(center.0 - r, center.1 - r, 2.0 * r, 2.0 * r)];
-        let _: () = msg_send![&*v, setUserInteractionEnabled: false];
-        let _: () = msg_send![&*v, setBackgroundColor: &*color(white, alpha)];
-        let layer: *mut AnyObject = msg_send![&*v, layer];
-        let _: () = msg_send![layer, setCornerRadius: r];
-        let _: () = msg_send![parent, addSubview: &*v];
-        v
+    pub fn root(window: &Window, width: f64, height: f64) -> Option<View> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::UiKit(h) = handle.as_raw() else { return None };
+        let view = unsafe { &*(h.ui_view.as_ptr() as *const AnyObject) };
+        unsafe {
+            let v: Retained<AnyObject> = msg_send![class!(UIView), new];
+            let _: () = msg_send![&*v, setFrame: rect(0.0, 0.0, width, height)];
+            let _: () = msg_send![&*v, setUserInteractionEnabled: false];
+            let _: () = msg_send![view, addSubview: &*v];
+            Some(v)
+        }
     }
-}
 
-fn label(parent: &AnyObject, r: f64) -> Retained<AnyObject> {
-    unsafe {
-        let l: Retained<AnyObject> = msg_send![class!(UILabel), new];
-        let _: () = msg_send![&*l, setFrame: rect(2.0, 0.0, 2.0 * r - 4.0, 2.0 * r)];
-        let _: () = msg_send![&*l, setUserInteractionEnabled: false];
-        let _: () = msg_send![&*l, setTextColor: &*color(1.0, 0.9)];
-        let font: Retained<AnyObject> = msg_send![class!(UIFont), boldSystemFontOfSize: (r * 0.42).clamp(9.0, 15.0)];
-        let _: () = msg_send![&*l, setFont: &*font];
-        let _: () = msg_send![&*l, setTextAlignment: 1isize];
-        let _: () = msg_send![&*l, setNumberOfLines: 2isize];
-        let _: () = msg_send![&*l, setAdjustsFontSizeToFitWidth: true];
-        let _: () = msg_send![parent, addSubview: &*l];
-        l
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } }
     }
-}
 
-fn set_text(l: &AnyObject, text: &str) {
-    unsafe { let _: () = msg_send![l, setText: &*NSString::from_str(text)]; }
-}
-fn set_hidden(v: &AnyObject, hidden: bool) {
-    unsafe { let _: () = msg_send![v, setHidden: hidden]; }
-}
-fn set_alpha_bg(v: &AnyObject, alpha: f64) {
-    unsafe { let _: () = msg_send![v, setBackgroundColor: &*color(1.0, alpha)]; }
-}
-fn move_to(v: &AnyObject, c: (f64, f64)) {
-    unsafe { let _: () = msg_send![v, setCenter: CGPoint { x: c.0, y: c.1 }]; }
+    fn color(white: f64, alpha: f64) -> Retained<AnyObject> {
+        unsafe { msg_send![class!(UIColor), colorWithWhite: white, alpha: alpha] }
+    }
+
+    pub fn circle(parent: &AnyObject, center: (f64, f64), r: f64, white: f64, alpha: f64) -> Retained<AnyObject> {
+        unsafe {
+            let v: Retained<AnyObject> = msg_send![class!(UIView), new];
+            let _: () = msg_send![&*v, setFrame: rect(center.0 - r, center.1 - r, 2.0 * r, 2.0 * r)];
+            let _: () = msg_send![&*v, setUserInteractionEnabled: false];
+            let _: () = msg_send![&*v, setBackgroundColor: &*color(white, alpha)];
+            let layer: *mut AnyObject = msg_send![&*v, layer];
+            let _: () = msg_send![layer, setCornerRadius: r];
+            let _: () = msg_send![parent, addSubview: &*v];
+            v
+        }
+    }
+
+    pub fn label(parent: &AnyObject, r: f64) -> Retained<AnyObject> {
+        unsafe {
+            let l: Retained<AnyObject> = msg_send![class!(UILabel), new];
+            let _: () = msg_send![&*l, setFrame: rect(2.0, 0.0, 2.0 * r - 4.0, 2.0 * r)];
+            let _: () = msg_send![&*l, setUserInteractionEnabled: false];
+            let _: () = msg_send![&*l, setTextColor: &*color(1.0, 0.9)];
+            let font: Retained<AnyObject> = msg_send![class!(UIFont), boldSystemFontOfSize: (r * 0.42).clamp(9.0, 15.0)];
+            let _: () = msg_send![&*l, setFont: &*font];
+            let _: () = msg_send![&*l, setTextAlignment: 1isize];
+            let _: () = msg_send![&*l, setNumberOfLines: 2isize];
+            let _: () = msg_send![&*l, setAdjustsFontSizeToFitWidth: true];
+            let _: () = msg_send![parent, addSubview: &*l];
+            l
+        }
+    }
+
+    pub fn set_text(l: &AnyObject, text: &str) {
+        unsafe { let _: () = msg_send![l, setText: &*NSString::from_str(text)]; }
+    }
+    pub fn set_hidden(v: &AnyObject, hidden: bool) {
+        unsafe { let _: () = msg_send![v, setHidden: hidden]; }
+    }
+    pub fn set_alpha_bg(v: &AnyObject, alpha: f64) {
+        unsafe { let _: () = msg_send![v, setBackgroundColor: &*color(1.0, alpha)]; }
+    }
+    pub fn move_to(v: &AnyObject, c: (f64, f64)) {
+        unsafe { let _: () = msg_send![v, setCenter: CGPoint { x: c.0, y: c.1 }]; }
+    }
 }
 
 pub fn install(window: &Window) {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Ok(handle) = window.window_handle() else { return };
-    let RawWindowHandle::UiKit(h) = handle.as_raw() else { return };
-    let view = unsafe { &*(h.ui_view.as_ptr() as *const AnyObject) };
-
     let scale = window.scale_factor();
     let full = window.outer_size().to_logical::<f64>(scale);
     let pos = window.inner_position().map(|p| p.to_logical::<f64>(scale)).unwrap_or_default();
     let inner = window.inner_size().to_logical::<f64>(scale);
     let safe = (pos.x, pos.y, inner.width, inner.height);
 
-    let root = unsafe {
-        let v: Retained<AnyObject> = msg_send![class!(UIView), new];
-        let _: () = msg_send![&*v, setFrame: rect(0.0, 0.0, full.width, full.height)];
-        let _: () = msg_send![&*v, setUserInteractionEnabled: false];
-        let _: () = msg_send![view, addSubview: &*v];
-        v
-    };
+    let Some(root) = view::root(window, full.width, full.height) else { return };
     let (sx, sy, sw, sh) = safe;
     let place = |a: Anchor| match a {
         BottomRight(dx, dy) => (sx + sw - dx, sy + sh - dy),
@@ -271,12 +287,12 @@ impl Overlay {
         p.0 < sx + sw * 0.4 && p.1 > sy + 70.0
     }
 
-    fn touch(&mut self, t: &Touch) {
-        let p = (t.location.x / self.scale, t.location.y / self.scale);
-        match t.phase {
+    fn touch(&mut self, id: u64, phase: TouchPhase, x: f64, y: f64) {
+        let p = (x / self.scale, y / self.scale);
+        match phase {
             TouchPhase::Started => {
                 if let Some(idx) = self.button_at(p) {
-                    self.grips.insert(t.id, Grip::Button { idx, start: p, last: p });
+                    self.grips.insert(id, Grip::Button { idx, start: p, last: p });
                     match self.spec_act(idx).map(|(_, a)| a) {
                         Some(AimToggle) => self.aim_latched = !self.aim_latched,
                         Some(NavToggle) => { self.nav = !self.nav; self.relabel(); }
@@ -284,14 +300,14 @@ impl Overlay {
                         _ => {}
                     }
                 } else if self.in_stick_zone(p) && !self.grips.values().any(|g| matches!(g, Grip::Stick { .. })) {
-                    self.grips.insert(t.id, Grip::Stick { origin: p, at: p });
+                    self.grips.insert(id, Grip::Stick { origin: p, at: p });
                 } else {
-                    self.grips.insert(t.id, Grip::Look { last: p });
+                    self.grips.insert(id, Grip::Look { last: p });
                 }
             }
             TouchPhase::Moved => {
-                let wheel = matches!(self.grips.get(&t.id), Some(Grip::Button { idx, .. }) if self.is_wheel(*idx));
-                match self.grips.get_mut(&t.id) {
+                let wheel = matches!(self.grips.get(&id), Some(Grip::Button { idx, .. }) if self.is_wheel(*idx));
+                match self.grips.get_mut(&id) {
                     Some(Grip::Stick { at, .. }) => *at = p,
                     Some(Grip::Button { last, .. }) if wheel => *last = p,
                     Some(Grip::Look { last }) | Some(Grip::Button { last, .. }) => {
@@ -305,7 +321,7 @@ impl Overlay {
                     None => {}
                 }
             }
-            TouchPhase::Ended | TouchPhase::Cancelled => { self.grips.remove(&t.id); }
+            TouchPhase::Ended | TouchPhase::Cancelled => { self.grips.remove(&id); }
         }
         self.apply();
     }
@@ -390,10 +406,16 @@ impl Overlay {
     }
 }
 
+#[cfg(target_os = "ios")]
 pub fn touch(t: &Touch) {
+    touch_at(t.id, t.phase, t.location.x, t.location.y);
+}
+
+/// A finger at (x, y) physical pixels of the window.
+pub fn touch_at(id: u64, phase: TouchPhase, x: f64, y: f64) {
     OVERLAY.with(|cell| {
         if let Some(o) = cell.borrow_mut().as_mut() {
-            if !o.hidden { o.touch(t); }
+            if !o.hidden { o.touch(id, phase, x, y); }
         }
     });
 }
