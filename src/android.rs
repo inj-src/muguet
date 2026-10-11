@@ -91,19 +91,25 @@ extern "C" {
     fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
 }
 
-/// stdout and stderr (everything the port prints) go to logcat and to muguet.log next to config.json.
+/// stdout and stderr (everything the port prints) go to muguet.log next to config.json, and the
+/// port's own lines to logcat. Whatever happens to logging, it must never stop the game: every
+/// thread that prints writes into this pipe and would wait on it once it's full.
 fn log_to_logcat() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         extern "C" {
             fn pipe(fds: *mut i32) -> i32;
             fn dup2(old: i32, new: i32) -> i32;
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         }
+        const F_SETPIPE_SZ: i32 = 1031;
         let mut fds = [0i32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             return;
         }
         unsafe {
+            // room for bursts while the file is being written
+            fcntl(fds[1], F_SETPIPE_SZ, 1i32 << 20);
             dup2(fds[1], 1);
             dup2(fds[1], 2);
         }
@@ -116,12 +122,24 @@ fn log_to_logcat() {
             let thread = std::thread::current().name().unwrap_or("?").to_string();
             eprintln!("[panic] thread {thread}: {info}\n{}", std::backtrace::Backtrace::force_capture());
         }));
+
+        // logcat on its own thread, fed without waiting: if liblog stalls (it did, on a OnePlus
+        // phone), lines for logcat are dropped and nothing else notices
+        let (logcat, lines) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+        std::thread::Builder::new()
+            .name("logcat".into())
+            .spawn(move || {
+                let tag = c"muguet";
+                for line in lines {
+                    let text = CString::new(line.into_iter().filter(|b| *b != 0 && *b != b'\n').collect::<Vec<u8>>()).unwrap_or_default();
+                    unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+                }
+            })
+            .ok();
+
         std::thread::Builder::new()
             .name("log".into())
             .spawn(move || {
-                // everything goes to the file, written in batches; logcat only gets the port's own
-                // "[...]" lines: the engine's chatter would cost time and push them out of its buffer
-                let tag = c"muguet";
                 let mut file = file.map(|f| std::io::BufWriter::with_capacity(64 << 10, f));
                 let mut read = std::io::BufReader::with_capacity(64 << 10, read);
                 let mut line = Vec::new();
@@ -132,9 +150,18 @@ fn log_to_logcat() {
                         let _ = f.write_all(&line);
                         if read.buffer().is_empty() { let _ = f.flush(); }
                     }
+                    // only the port's "[...]" lines: the engine's chatter would push them out of logcat
                     if line.first() == Some(&b'[') {
-                        let text = CString::new(line.iter().copied().filter(|b| *b != 0 && *b != b'\n').collect::<Vec<u8>>()).unwrap_or_default();
-                        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+                        let _ = logcat.try_send(line.clone());
+                    }
+                }
+                // nobody reads the pipe anymore: printing must not block or fail, send it nowhere
+                if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                    use std::os::fd::IntoRawFd;
+                    let fd = null.into_raw_fd();
+                    unsafe {
+                        dup2(fd, 1);
+                        dup2(fd, 2);
                     }
                 }
             })
