@@ -13,6 +13,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.StatFs;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -311,7 +312,8 @@ public class LauncherActivity extends Activity {
         new Thread(() -> {
             String err;
             try (ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r")) {
-                err = pfd == null ? "could not open the file" : Native.importZip(pfd.getFd());
+                if (pfd == null) err = "could not open the file";
+                else if ((err = spaceFor(pfd.getStatSize())) == null) err = Native.importZip(pfd.getFd());
             } catch (Exception e) {
                 err = String.valueOf(e.getMessage());
             }
@@ -321,6 +323,15 @@ public class LauncherActivity extends Activity {
                 else prepare(false);
             });
         }, "import").start();
+    }
+
+    /** The game unpacks to about the zip's size (its files are compressed already). Null if it fits. */
+    private String spaceFor(long zipSize) {
+        if (zipSize <= 0) return null;
+        long free = new StatFs(Native.supportDir(this).getPath()).getAvailableBytes();
+        long need = zipSize + (1L << 30); // and room for the compiled game code
+        if (free >= need) return null;
+        return String.format("not enough free space: the game needs about %.1f GB, the device has %.1f GB free", need / 1e9, free / 1e9);
     }
 
     /** Compiles the game's code if this device doesn't have it yet, then plays if asked. */

@@ -9,8 +9,13 @@ use std::path::{Path, PathBuf};
 
 const SKIPPED_DIRS: &[&str] = &["env_test", "verityradio"];
 
-pub fn import(zip_path: &Path, dest: &Path, keep_code: bool, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+pub fn import(zip_path: &Path, dest: &Path, keep_code: bool, progress: impl FnMut(u64, u64)) -> Result<()> {
     let file = File::open(zip_path).with_context(|| format!("{}", zip_path.display()))?;
+    import_file(file, dest, keep_code, progress)
+}
+
+/// Imports from a zip that is already open (Android hands the picked file over as a descriptor).
+pub fn import_file(file: File, dest: &Path, keep_code: bool, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     let mut zip = zip::ZipArchive::new(std::io::BufReader::with_capacity(1 << 20, file)).context("not a zip file")?;
 
     let names: Vec<String> = zip.file_names().map(String::from).collect();

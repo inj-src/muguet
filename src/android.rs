@@ -292,11 +292,12 @@ static IMPORT_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub unsafe extern "system" fn Java_ch_cclerc_muguet_Native_importZip(env: *mut JNIEnv, _: jclass, fd: jint) -> jstring {
     IMPORT_DONE.store(0, Ordering::Relaxed);
     IMPORT_TOTAL.store(0, Ordering::Relaxed);
-    let zip = PathBuf::from(format!("/proc/self/fd/{fd}"));
     let keep_code = !crate::code_embedded();
-    let result = crate::import::import(&zip, &crate::config::game_dir(), keep_code, |done, total| {
-        IMPORT_DONE.store(done, Ordering::Relaxed);
-        IMPORT_TOTAL.store(total, Ordering::Relaxed);
+    let result = zip_file(fd).and_then(|zip| {
+        crate::import::import_file(zip, &crate::config::game_dir(), keep_code, |done, total| {
+            IMPORT_DONE.store(done, Ordering::Relaxed);
+            IMPORT_TOTAL.store(total, Ordering::Relaxed);
+        })
     });
     match result {
         Ok(()) => std::ptr::null_mut(),
@@ -305,6 +306,26 @@ pub unsafe extern "system" fn Java_ch_cclerc_muguet_Native_importZip(env: *mut J
             to_java(env, &format!("{e:#}"))
         }
     }
+}
+
+/// Our own handle on the picked file. Not reopened through /proc/self/fd: Android refuses that
+/// for files from the system picker. Java closes its descriptor when the import returns.
+fn zip_file(fd: jint) -> anyhow::Result<std::fs::File> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::FromRawFd;
+    extern "C" {
+        fn dup(fd: i32) -> i32;
+    }
+    let own = unsafe { dup(fd) };
+    if own < 0 {
+        anyhow::bail!("could not read the picked file: {}", std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(own) };
+    // a zip is read from its end: a file streamed by a cloud app can't be
+    if file.seek(SeekFrom::End(0)).and_then(|_| file.seek(SeekFrom::Start(0))).is_err() {
+        anyhow::bail!("this file can only be streamed, not read in place: copy it to the device's storage and pick that copy");
+    }
+    Ok(file)
 }
 
 #[no_mangle]
