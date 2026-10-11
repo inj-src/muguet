@@ -146,6 +146,8 @@ fn log_to_logcat() {
                 loop {
                     line.clear();
                     if !matches!(read.read_until(b'\n', &mut line), Ok(n) if n > 0) { break; }
+                    LOG_LINES.fetch_add(1, Ordering::Relaxed);
+                    LOG_LAST.store(START.elapsed().as_millis() as u64, Ordering::Relaxed);
                     if let Some(f) = file.as_mut() {
                         let _ = f.write_all(&line);
                         if read.buffer().is_empty() { let _ = f.flush(); }
@@ -166,7 +168,43 @@ fn log_to_logcat() {
                 }
             })
             .ok();
+        status_file();
     });
+}
+
+static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+static LOG_LINES: AtomicU64 = AtomicU64::new(0);
+static LOG_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// muguet-status.txt, rewritten every 2 s by its own thread and not through the log: when the
+/// game freezes it still tells whether the log, the renderer or the engine stopped moving.
+fn status_file() {
+    let _ = *START;
+    std::thread::Builder::new()
+        .name("status".into())
+        .spawn(|| {
+            let path = support_dir().join("muguet-status.txt");
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let now = START.elapsed().as_millis() as u64;
+                let heap = crate::RT.get().map(|r| r.mem.data_size() >> 20).unwrap_or(0);
+                let text = format!(
+                    "uptime {:.0} s\nlog lines {} (last {:.1} s ago)\ngpu started {}, frames presented {}, suspended {}\ngame input ready {}, controller {}\nmemory {} MB, game heap {} MB\n",
+                    now as f64 / 1e3,
+                    LOG_LINES.load(Ordering::Relaxed),
+                    now.saturating_sub(LOG_LAST.load(Ordering::Relaxed)) as f64 / 1e3,
+                    crate::gpu::STARTED.load(Ordering::Relaxed),
+                    crate::gpu::PRESENTS.load(Ordering::Relaxed),
+                    crate::gpu::SUSPENDED.load(Ordering::Relaxed),
+                    crate::input::ready(),
+                    crate::pad::ACTIVE.load(Ordering::Relaxed),
+                    crate::footprint_mb(),
+                    heap,
+                );
+                let _ = std::fs::write(&path, text);
+            }
+        })
+        .ok();
 }
 
 // ---- input, from GameActivity.java ----

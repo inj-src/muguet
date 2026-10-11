@@ -24,6 +24,9 @@ android {
             isMinifyEnabled = false
             // installable as is (sideloading); sign with your own key for anything else
             signingConfig = signingConfigs.getByName("debug")
+            // lets android/report.sh dump a frozen game's threads (debuggerd -b); the game's code
+            // is native and runs the same, only the Java launcher is affected
+            isDebuggable = true
         }
     }
 
