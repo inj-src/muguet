@@ -39,7 +39,7 @@ fn android_main(app: AndroidApp) {
         Err(e) => {
             eprintln!("[config] {e:#}");
             alert("Muguet", &format!("{e:#}"));
-            std::process::exit(1);
+            quit(1);
         }
     };
     let args = crate::engine_args(&startup);
@@ -49,7 +49,7 @@ fn android_main(app: AndroidApp) {
         eprintln!("[app] {e:#}");
     }
     // the game's state is global: never run it twice in one process
-    std::process::exit(0);
+    quit(0);
 }
 
 fn set_paths(support: Option<PathBuf>, internal: Option<PathBuf>) {
@@ -66,6 +66,18 @@ fn set_paths(support: Option<PathBuf>, internal: Option<PathBuf>) {
 
 fn support_dir() -> PathBuf {
     PathBuf::from(std::env::var("MUGUET_SUPPORT").unwrap_or_default())
+}
+
+/// Ends the process without exit(): that runs the system libraries' C++ teardown while their
+/// threads (UI rendering, audio, the GPU driver) still run, and Android aborts on their destroyed
+/// mutexes. The log gets a moment to reach muguet.log first.
+pub fn quit(code: i32) -> ! {
+    extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    eprintln!("[app] quitting ({code})");
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe { _exit(code) }
 }
 
 /// The launcher shows this file on its next start.
@@ -99,7 +111,7 @@ fn log_to_logcat() {
         // keep the last run's log: after a crash it's the one that matters (the launcher shares it)
         let log = support_dir().join("muguet.log");
         let _ = std::fs::rename(&log, support_dir().join("muguet-previous.log"));
-        let mut file = std::fs::File::create(&log).ok();
+        let file = std::fs::File::create(&log).ok();
         std::panic::set_hook(Box::new(|info| {
             let thread = std::thread::current().name().unwrap_or("?").to_string();
             eprintln!("[panic] thread {thread}: {info}\n{}", std::backtrace::Backtrace::force_capture());
@@ -107,14 +119,23 @@ fn log_to_logcat() {
         std::thread::Builder::new()
             .name("log".into())
             .spawn(move || {
+                // everything goes to the file, written in batches; logcat only gets the port's own
+                // "[...]" lines: the engine's chatter would cost time and push them out of its buffer
                 let tag = c"muguet";
-                for line in std::io::BufReader::new(read).split(b'\n').map_while(Result::ok) {
+                let mut file = file.map(|f| std::io::BufWriter::with_capacity(64 << 10, f));
+                let mut read = std::io::BufReader::with_capacity(64 << 10, read);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    if !matches!(read.read_until(b'\n', &mut line), Ok(n) if n > 0) { break; }
                     if let Some(f) = file.as_mut() {
                         let _ = f.write_all(&line);
-                        let _ = f.write_all(b"\n");
+                        if read.buffer().is_empty() { let _ = f.flush(); }
                     }
-                    let text = CString::new(line.into_iter().filter(|b| *b != 0).collect::<Vec<u8>>()).unwrap_or_default();
-                    unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+                    if line.first() == Some(&b'[') {
+                        let text = CString::new(line.iter().copied().filter(|b| *b != 0 && *b != b'\n').collect::<Vec<u8>>()).unwrap_or_default();
+                        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+                    }
                 }
             })
             .ok();

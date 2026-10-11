@@ -142,7 +142,10 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         "_emscripten_throw_longjmp" => { PENDING_LONGJMP.with(|c| c.set(true)); return Err(LongJmp.into()); }
         "exit" | "proc_exit" => {
             eprintln!("[host] engine exit({})", int(params, 0));
-            std::process::exit(int(params, 0) as i32);
+            if cfg!(target_os = "android") && int(params, 0) != 0 {
+                crate::alert("Muguet", &format!("The game exited with code {}", int(params, 0)));
+            }
+            crate::quit(int(params, 0) as i32);
         }
         "_abort_js" => anyhow::bail!("engine called abort()"),
         "emscripten_num_logical_cores" => set_int(results, std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(8)),

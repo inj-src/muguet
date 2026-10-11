@@ -248,7 +248,13 @@ pub fn run_engine(rt: &Arc<Runtime>, args: Vec<String>) -> Result<()> {
             eprintln!("[host] main unwound with a live runtime; waiting on engine threads");
             loop { std::thread::park(); }
         }
-        Err(e) => eprintln!("[host] main trapped: {e:?}"),
+        Err(e) => {
+            eprintln!("[host] main trapped: {e:?}");
+            if cfg!(target_os = "android") {
+                let first = format!("{e:#}").lines().next().unwrap_or_default().chars().take(300).collect::<String>();
+                alert("Muguet", &format!("The game stopped: {first}"));
+            }
+        }
     }
     Ok(())
 }
@@ -611,6 +617,14 @@ pub fn read_cstr(mem: &SharedMemory, addr: u64) -> String {
         a += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Ends the app (on Android without exit(), see android::quit).
+pub fn quit(code: i32) -> ! {
+    #[cfg(target_os = "android")]
+    android::quit(code);
+    #[cfg(not(target_os = "android"))]
+    std::process::exit(code)
 }
 
 #[cfg(target_os = "android")]

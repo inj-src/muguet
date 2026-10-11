@@ -111,7 +111,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 crate::mp::shutdown();
-                std::process::exit(0);
+                crate::quit(0);
             }
             WindowEvent::Resized(_) => {
                 let (w, h) = backbuffer_size(&window);
@@ -134,7 +134,7 @@ impl ApplicationHandler for App {
                 if self.mods.super_key() {
                     if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyQ) = event.physical_key {
                         crate::mp::shutdown();
-                        std::process::exit(0);
+                        crate::quit(0);
                     }
 
                     if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyF) = event.physical_key {
@@ -218,7 +218,7 @@ impl App {
                         eprintln!("[host] {e:#}");
                         if cfg!(target_os = "android") {
                             crate::alert("Muguet", &format!("{e:#}"));
-                            std::process::exit(1);
+                            crate::quit(1);
                         }
                         return;
                     }
@@ -226,7 +226,7 @@ impl App {
                 if let Err(e) = crate::run_engine(&rt, args) {
                     eprintln!("[host] engine failed: {e:?}");
                 }
-                std::process::exit(0);
+                crate::quit(0);
             })
             .expect("spawn engine thread");
     }
