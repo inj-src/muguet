@@ -37,6 +37,12 @@ fn key_byte(vk: u8) -> Option<&'static AtomicU8> {
     base().map(|p| unsafe { &*(p.add(vk as usize) as *const AtomicU8) })
 }
 
+/// Whether the game has told us where its input state lives (before that, input goes nowhere).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn ready() -> bool {
+    BLOCK.load(Ordering::Acquire) != 0
+}
+
 pub fn publish(block: u64) {
     BLOCK.store(block, Ordering::Release);
     let (w, h) = *SIZE.lock().unwrap();

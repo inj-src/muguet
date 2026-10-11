@@ -4,6 +4,8 @@
 package ch.cclerc.muguet;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.graphics.Insets;
 import android.graphics.Typeface;
@@ -32,6 +34,7 @@ import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 import java.io.File;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -82,6 +85,7 @@ public class LauncherActivity extends Activity {
             }
             last.delete();
         }
+        if (error == null) error = LogReport.lastProblem(this);
         refresh();
     }
 
@@ -132,6 +136,11 @@ public class LauncherActivity extends Activity {
         secondary.setAllCaps(false);
         secondary.setOnClickListener(v -> pickZip());
         left.addView(secondary);
+        Button share = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        share.setText("Share log");
+        share.setAllCaps(false);
+        share.setOnClickListener(v -> shareLog());
+        left.addView(share);
         TextView credit = new TextView(this);
         credit.setText("proudly made by c22dev");
         credit.setAlpha(0.6f);
@@ -286,6 +295,18 @@ public class LauncherActivity extends Activity {
         status.setTextColor(error != null && !busy ? 0xFFFF6B6B : 0xFFCCCCCC);
         ui.removeCallbacks(tick);
         if (phase == Phase.IMPORTING) ui.postDelayed(tick, 250);
+    }
+
+    /** Copies the log report and offers to send it. */
+    private void shareLog() {
+        String report = LogReport.build(this);
+        ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Muguet log", report));
+        Toast.makeText(this, "Log copied", Toast.LENGTH_SHORT).show();
+        Intent send = new Intent(Intent.ACTION_SEND);
+        send.setType("text/plain");
+        send.putExtra(Intent.EXTRA_SUBJECT, "Muguet log");
+        send.putExtra(Intent.EXTRA_TEXT, report);
+        startActivity(Intent.createChooser(send, "Share log"));
     }
 
     // ---- import, compile, play ----

@@ -96,7 +96,14 @@ fn log_to_logcat() {
             dup2(fds[1], 2);
         }
         let read = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]) };
-        let mut file = std::fs::File::create(support_dir().join("muguet.log")).ok();
+        // keep the last run's log: after a crash it's the one that matters (the launcher shares it)
+        let log = support_dir().join("muguet.log");
+        let _ = std::fs::rename(&log, support_dir().join("muguet-previous.log"));
+        let mut file = std::fs::File::create(&log).ok();
+        std::panic::set_hook(Box::new(|info| {
+            let thread = std::thread::current().name().unwrap_or("?").to_string();
+            eprintln!("[panic] thread {thread}: {info}\n{}", std::backtrace::Backtrace::force_capture());
+        }));
         std::thread::Builder::new()
             .name("log".into())
             .spawn(move || {
@@ -142,10 +149,14 @@ fn push(m: Msg) {
 
 /// Delivers the input Java sent since the last call, on the event loop thread.
 pub fn drain_input() {
+    static FIRST: Once = Once::new();
     let msgs = std::mem::take(&mut *QUEUE.lock().unwrap());
     for m in msgs {
         match m {
-            Msg::Touch(id, phase, x, y) => crate::touch::touch_at(id, phase, x, y),
+            Msg::Touch(id, phase, x, y) => {
+                FIRST.call_once(|| eprintln!("[input] first touch at {x:.0},{y:.0} px, game input {}", if crate::input::ready() { "ready" } else { "not ready yet" }));
+                crate::touch::touch_at(id, phase, x, y)
+            }
             Msg::Key { code, down, ch, repeat } => {
                 let Some(name) = dom_code(code) else { continue };
                 if down && !repeat {

@@ -292,6 +292,9 @@ impl Overlay {
         match phase {
             TouchPhase::Started => {
                 if let Some(idx) = self.button_at(p) {
+                    if let Some((label, _)) = self.spec_act(idx) {
+                        eprintln!("[touch] {} ({})", label.replace('\n', " "), if input::ready() { "sent" } else { "game input not ready" });
+                    }
                     self.grips.insert(id, Grip::Button { idx, start: p, last: p });
                     match self.spec_act(idx).map(|(_, a)| a) {
                         Some(AimToggle) => self.aim_latched = !self.aim_latched,
